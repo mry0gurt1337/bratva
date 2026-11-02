@@ -81,10 +81,10 @@ const freshStats = () => ({ money: C.START_MONEY, auth: 0, goons: 0, pos: 0, jai
 
 function newRoom(code) {
   return {
-    code, hostId: null, status: 'LOBBY', settings: { rounds: 20 }, players: [],
+    code, hostId: null, status: 'LOBBY', settings: { rounds: 20, glok: true }, players: [],
     turn: 0, phase: null, pending: null, props: {}, heat: 0, omon: null,
     logs: [], logSeq: 0, dice: null, lastMove: null, moveSeq: 0, fx: null, fxSeq: 0,
-    round: 1, winner: null, standings: null, deck: [],
+    round: 1, winner: null, standings: null, deck: [], sealed: null, glokTask: null, glokCont: null, turnsSinceGlok: 0,
     deadline: null, deadlineTotal: null, _timer: null, emptySince: null,
   };
 }
@@ -104,7 +104,8 @@ function publicState(r) {
     })),
     turn: r.turn, phase: r.phase, pending: r.pending, props: r.props, heat: r.heat, omon: r.omon,
     logs: r.logs, dice: r.dice, lastMove: r.lastMove, fx: r.fx, round: r.round,
-    winner: r.winner, standings: r.standings,
+    winner: r.winner, standings: r.standings, sealed: r.sealed,
+    glokTask: r.glokTask ? { kind: r.glokTask.kind, seq: r.glokTask.seq, prize: r.glokTask.prize, ms: T(r.glokTask.ms), line: r.glokTask.line, taps: r.glokTask.taps } : null,
     remaining: r.deadline ? Math.max(0, r.deadline - Date.now()) : null, total: r.deadlineTotal,
   };
 }
@@ -241,6 +242,10 @@ function landProp(r, p, c) {
   }
   const owner = byId(r, pr.owner);
   if (!owner || owner.bankrupt) return afterAction(r);
+  if (r.sealed && r.sealed.cell === c.id && r.round <= r.sealed.until) {
+    log(r, `«${c.name}» опечатана Димой Глоком — ${p.name} проходит бесплатно`, 'glok');
+    return afterAction(r);
+  }
   const rent = G.rentOf(r.props, c.id);
   return ask(r, { type: 'STRELKA', cell: c.id, rent, owner: owner.id, ownerName: owner.name });
 }
@@ -461,8 +466,148 @@ function omonCheck(r) {
   log(r, 'Облава закончена, розыск сброшен', 'info');
 }
 
+
+// ---------- Надзиратель Дима Глок ----------
+// Приходит в случайный момент между ходами и устраивает движ.
+const GLOK_LINES = [
+  'Так-так-так… кто тут у нас?', 'Скучно мне что-то, братва.', 'Надзиратель Глок на смене!',
+  'Ничего личного, просто работа.', 'Расслабились? Зря.', 'Сюрприз, граждане!', 'Опять без меня веселитесь?',
+];
+const richest = (r) => active(r).slice().sort((a, b) => b.money - a.money)[0];
+const poorest = (r) => active(r).slice().sort((a, b) => a.money - b.money)[0];
+const two = (r) => { const a = shuffle(active(r).slice()); return a.length >= 2 ? [a[0], a[1]] : null; };
+const GLOK_EVENTS = [
+  { w: 3, f(r) {
+    const a = richest(r), b = poorest(r);
+    if (!a || a === b) return null;
+    const x = Math.max(20, Math.round(a.money * 0.15 / 10) * 10);
+    pay(r, a, x, b);
+    return { title: 'ШМОН', text: `Отобрал у ${a.name} $${x} и отдал ${b.name}. «Делиться надо!»` };
+  } },
+  { w: 3, f(r) {
+    active(r).forEach((p) => pay(r, p, 25, null));
+    return { title: 'НА ЧАЙ', text: 'Каждый скидывается Диме по $25. Без вопросов.' };
+  } },
+  { w: 2, f(r) {
+    const p = active(r)[rnd(active(r).length)];
+    p.money += 150;
+    return { title: 'ДИМА ДОБРЫЙ', text: `${p.name} получает $150. Просто так. Не привыкай.` };
+  } },
+  { w: 2, f(r) {
+    const t = two(r); if (!t) return null;
+    [t[0].pos, t[1].pos] = [t[1].pos, t[0].pos];
+    return { title: 'ПЕРЕКЛИЧКА', text: `${t[0].name} и ${t[1].name} поменялись местами. Глок так видит.` };
+  } },
+  { w: 1, f(r) {
+    const t = two(r); if (!t) return null;
+    [t[0].money, t[1].money] = [t[1].money, t[0].money];
+    return { title: 'ПЕРЕПУТАЛ ВЕДОМОСТИ', text: `${t[0].name} и ${t[1].name} обменялись ВСЕМИ деньгами. Упс.` };
+  } },
+  { w: 2, f(r) {
+    active(r).forEach((p) => { p.pos = (p.pos - 3 + N) % N; });
+    return { title: 'ВСЕМ ЛЕЧЬ!', text: 'Все отползают на 3 клетки назад. Мордой в пол!' };
+  } },
+  { w: 2, f(r) {
+    const owned = Object.keys(r.props);
+    if (!owned.length) return null;
+    const cell = +owned[rnd(owned.length)];
+    r.sealed = { cell, until: r.round + 2 };
+    const o = byId(r, r.props[cell].owner);
+    return { title: 'ОПЕЧАТАНО', text: `«${cellName(cell)}» (${o ? o.name : '—'}) закрыта на 2 круга. Ренты нет.` };
+  } },
+  { w: 1, f(r) {
+    if (r.omon !== null) return null;
+    r.heat = C.MAX_HEAT; r.omon = C.POLICE;
+    return { title: 'ВЫЗВАЛ ОМОН', text: 'Дима позвонил куда надо. ОМОН уже выехал.' };
+  } },
+  { w: 2, f(r) {
+    r.players.forEach((p) => { p.jail = 0; });
+    r.heat = 0; r.omon = null;
+    return { title: 'АМНИСТИЯ', text: 'У Димы день рождения: все на свободе, розыск сброшен.' };
+  } },
+  { w: 2, f(r) {
+    const p = active(r).filter((x) => x.goons > 0).sort((a, b) => b.goons - a.goons)[0];
+    if (!p) return null;
+    p.goons -= 1;
+    return { title: 'ИСПРАВРАБОТЫ', text: `Забрал братка у ${p.name} — пусть картошку чистит.` };
+  } },
+  { w: 3, challenge: 'race' },
+  { w: 3, challenge: 'trap' },
+];
+
+function maybeGlok(r, cont) {
+  r.turnsSinceGlok = (r.turnsSinceGlok || 0) + 1;
+  const chance = process.env.GLOK_ALWAYS ? 100 : 16;
+  if (!r.settings.glok || r.round < 2 || r.turnsSinceGlok < 4 || rnd(100) >= chance || active(r).length < 2) return cont();
+  r.turnsSinceGlok = 0;
+  const pool = GLOK_EVENTS.flatMap((e) => Array(e.w).fill(e));
+  for (let i = 0; i < 6; i++) {
+    const ev = pool[rnd(pool.length)];
+    if (ev.challenge) return glokChallenge(r, ev.challenge, cont);
+    const res = ev.f(r);
+    if (!res) continue;
+    log(r, `👮 Дима Глок: ${res.title} — ${res.text}`, 'glok');
+    r.fx = { type: 'glok', title: res.title, text: res.text, line: GLOK_LINES[rnd(GLOK_LINES.length)], seq: ++r.fxSeq };
+    r.phase = 'GLOK'; r.pending = null;
+    sync(r);
+    return later(r, T(3200), cont);
+  }
+  cont();
+}
+
+function glokChallenge(r, kind, cont) {
+  const ms = 6000;
+  const task = { kind, seq: ++r.fxSeq, prize: kind === 'race' ? 150 : 100, ms, taps: [], line: GLOK_LINES[rnd(GLOK_LINES.length)] };
+  r.glokTask = task;
+  r.phase = 'GLOK'; r.pending = null;
+  log(r, kind === 'race' ? '👮 Дима Глок: кто первый нажмёт — получит $150!' : '👮 Дима Глок раздаёт халяву… подозрительно', 'glok');
+  // боты тоже участвуют: в гонке жмут быстро, в ловушку попадаются иногда
+  active(r).filter((p) => p.bot).forEach((p) => {
+    if (kind === 'trap' && rnd(100) >= 35) return;
+    setTimeout(() => safe(() => glokTap(r, p, task.seq)), T(1200 + rnd(3500)));
+  });
+  r.glokCont = cont;
+  sync(r);
+  later(r, T(ms), () => finishGlok(r));
+}
+
+function glokTap(r, p, seq) {
+  const t = r.glokTask;
+  if (!t || t.seq !== seq || p.bankrupt || t.taps.includes(p.id)) return;
+  t.taps.push(p.id);
+  if (t.kind === 'race') finishGlok(r);
+}
+
+function finishGlok(r) {
+  const t = r.glokTask;
+  if (!t) return;
+  r.glokTask = null;
+  clearTimer(r);
+  let title, text;
+  if (t.kind === 'race') {
+    const w = byId(r, t.taps[0]);
+    if (w) { w.money += t.prize; title = 'ЕСТЬ ПОБЕДИТЕЛЬ'; text = `${w.name} самый шустрый: +$${t.prize}. Остальные — тормоза.`; }
+    else { title = 'НИКТО?!'; text = 'Все проспали. Дима обиделся и забрал деньги себе.'; }
+  } else {
+    const losers = t.taps.map((id) => byId(r, id)).filter(Boolean);
+    losers.forEach((p) => pay(r, p, t.prize, null));
+    title = 'ЭТО БЫЛА ЛОВУШКА';
+    text = losers.length ? `Халявы нет! ${losers.map((p) => p.name).join(', ')} — штраф по $${t.prize}. Ха-ха.` : 'Никто не повёлся. Скучные вы, братва.';
+  }
+  log(r, `👮 Дима Глок: ${text}`, 'glok');
+  r.fx = { type: 'glok', title, text, line: '', seq: ++r.fxSeq, result: true };
+  sync(r);
+  const cont = r.glokCont; r.glokCont = null;
+  later(r, T(2800), () => cont && cont());
+}
+
 function endTurn(r) {
   omonStep(r);
+  if (checkWin(r)) return;
+  maybeGlok(r, () => nextTurn(r));
+}
+
+function nextTurn(r) {
   if (checkWin(r)) return;
   const len = r.players.length;
   let n = r.turn, wrapped = false;
@@ -534,6 +679,7 @@ function startGame(r) {
   Object.assign(r, {
     status: 'PLAYING', turn: 0, props: {}, heat: 0, omon: null, round: 1,
     winner: null, standings: null, dice: null, lastMove: null, fx: null, deck: [],
+    sealed: null, glokTask: null, glokCont: null, turnsSinceGlok: 0,
   });
   log(r, `Замес начался! Первым ходит ${r.players[0].name}`, 'start');
   startTurn(r);
@@ -556,7 +702,7 @@ function surrender(r, p) {
   log(r, `${p.name} покинул город`, 'info');
   bankrupt(r, p);
   if (checkWin(r)) return;
-  if (wasTurn) { clearTimer(r); r.pending = null; endTurn(r); }
+  if (wasTurn && r.phase !== 'GLOK') { clearTimer(r); r.pending = null; endTurn(r); }
   else sync(r);
 }
 
@@ -641,9 +787,11 @@ io.on('connection', (socket) => {
     sync(r);
   });
 
-  on('settings', ({ rounds }) => {
+  on('settings', ({ rounds, glok }) => {
     if (!host() || me.r.status !== 'LOBBY') return;
-    if ([0, 10, 20, 30].includes(rounds)) { me.r.settings.rounds = rounds; sync(me.r); }
+    if ([0, 10, 20, 30].includes(rounds)) me.r.settings.rounds = rounds;
+    if (typeof glok === 'boolean') me.r.settings.glok = glok;
+    sync(me.r);
   });
 
   on('start', () => {
@@ -662,6 +810,7 @@ io.on('connection', (socket) => {
   });
 
   const myTurn = () => me && me.r.status === 'PLAYING' && cur(me.r) === me.p;
+  on('glok', ({ seq }) => { if (me && me.r.status === 'PLAYING') glokTap(me.r, me.p, seq); });
   on('roll', () => { if (myTurn() && me.r.phase === 'ROLL') doRoll(me.r); });
   on('decide', ({ choice }) => { if (myTurn() && me.r.phase === 'DECIDE') resolve(me.r, String(choice)); });
 
